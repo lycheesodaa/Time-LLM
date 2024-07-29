@@ -16,13 +16,14 @@ class FlattenHead(nn.Module):
     def __init__(self, n_vars, nf, target_window, head_dropout=0):
         super().__init__()
         self.n_vars = n_vars
-        self.flatten = nn.Flatten(start_dim=-2)
+        self.flatten = nn.Flatten(start_dim=-2) # flattens last two dimensions
         self.linear = nn.Linear(nf, target_window)
         self.dropout = nn.Dropout(head_dropout)
 
     def forward(self, x):
-        x = self.flatten(x)
-        x = self.linear(x)
+        # x is of dimensions (16, 1, 128, 12)
+        x = self.flatten(x) # (16, 1, 128 * 12)
+        x = self.linear(x) # (16, 1, 96)
         x = self.dropout(x)
         return x
 
@@ -194,22 +195,91 @@ class Model(nn.Module):
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]
+            return dec_out[:, -self.pred_len:, :]  # [B, L, D] return the predicted part of sequence
         return None
 
+    '''
+    Breakdowns of input/output sizes
+    
+    Assumptions:
+
+        Batch size (B) = 16
+        Sequence length (T) = 32
+        Number of variables (N) = 7
+        Prediction length (pred_len) = 96
+        Patch length (patch_len) = 16
+        Stride (stride) = 8
+        d_model = 32
+        d_ff = 128
+        LLM embedding dimension (d_llm) = 768
+        
+    Step-by-step breakdown:
+        
+        Input: x_enc
+            Shape: (B, T, N) = (16, 32, 7)
+        
+        After normalization:
+            Shape remains (16, 32, 7)
+        
+        Reshape for individual variable processing:
+            Shape: (B * N, T, 1) = (224, 32, 1)
+        
+        Calculate statistics (min, max, median, lags, trends):
+            Each statistic has shape (224, 1) or (224, 5) for lags
+        
+        Create and tokenize prompts:
+            Tokenized shape depends on the tokenizer, let's say (16, 128) for 128 tokens
+        
+        Get prompt embeddings:
+            Shape: (16, 128, d_llm) = (16, 128, 768)
+        
+        Patch embedding:
+            Input shape: (16, 7, 32)
+            Output shape: (16, num_patches, d_model)
+            Where num_patches = (32 - 16) / 8 + 2 = 12
+            So, output shape: (16, 12, 32)
+        
+        After reprogramming layer:
+            Shape remains (16, 12, 768)
+        
+        Concatenate prompt embeddings and patch embeddings:
+            Shape: (16, 128 + 12, 768) = (16, 140, 768)
+        
+        LLM processing:
+            Output shape: (16, 140, 768)
+        
+        Select d_ff dimension:
+            Shape: (16, 140, 128)
+        
+        Reshape for output projection:
+            Shape: (16, 7, 128, 12)
+        
+        Output projection:
+            Shape: (16, 7, pred_len) = (16, 7, 96)
+        
+        Final permute:
+            Shape: (16, 96, 7)
+        
+        Denormalization:
+            Shape remains (16, 96, 7)
+        
+        Final output: dec_out
+            Shape: (B, pred_len, N) = (16, 96, 7)
+    '''
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
 
         x_enc = self.normalize_layers(x_enc, 'norm')
 
-        B, T, N = x_enc.size()
-        x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+        B, T, N = x_enc.size() # (batch_size, seq_len, n_vars)
+        x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1) # (batch_size * n_vars, pred_len, 1)
 
-        min_values = torch.min(x_enc, dim=1)[0]
-        max_values = torch.max(x_enc, dim=1)[0]
-        medians = torch.median(x_enc, dim=1).values
-        lags = self.calcute_lags(x_enc)
-        trends = x_enc.diff(dim=1).sum(dim=1)
+        min_values = torch.min(x_enc, dim=1)[0] # (batch_size * n_vars, 1)
+        max_values = torch.max(x_enc, dim=1)[0] # (batch_size * n_vars, 1)
+        medians = torch.median(x_enc, dim=1).values # (batch_size * n_vars, 1)
+        lags = self.calcute_lags(x_enc) # (batch_size * n_vars, 5)
+        trends = x_enc.diff(dim=1).sum(dim=1) # (batch_size * n_vars, 1)
 
+        # create a new prompt for each variable(?)
         prompt = []
         for b in range(x_enc.shape[0]):
             min_values_str = str(min_values[b].tolist()[0])
@@ -231,15 +301,21 @@ class Model(nn.Module):
 
         x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
 
+        # get embeddings for the prompt created above
         prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
         prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))  # (batch, prompt_token, dim)
 
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
 
+        # creating our patch embeddings and pass into the reprogramming layer
         x_enc = x_enc.permute(0, 2, 1).contiguous()
         enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
+
+        # concatenating the prompt embedding and the reprogrammed embedding
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
+
+        # pass into the LLM
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
         dec_out = dec_out[:, :, :self.d_ff]
 
@@ -247,6 +323,7 @@ class Model(nn.Module):
             dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
         dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
 
+        # project into output space
         dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
         dec_out = dec_out.permute(0, 2, 1).contiguous()
 

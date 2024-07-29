@@ -176,16 +176,20 @@ for ii in range(args.itr):
 
         model.train()
         epoch_time = time.time()
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(train_loader)):
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(train_loader), total=len(train_loader)):
             iter_count += 1
             model_optim.zero_grad()
 
-            batch_x = batch_x.float().to(accelerator.device)
-            batch_y = batch_y.float().to(accelerator.device)
+            batch_x = batch_x.float().to(accelerator.device) # input time horizon
+            batch_y = batch_y.float().to(accelerator.device) # target horizon
+
+            # _mark holds information about time-related features. Specifically, it is a
+            # tensor that encodes temporal information and is associated with the
+            # input data batch_x/batch_y. Not in use
             batch_x_mark = batch_x_mark.float().to(accelerator.device)
             batch_y_mark = batch_y_mark.float().to(accelerator.device)
 
-            # decoder input
+            # decoder input (not used)
             dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(
                 accelerator.device)
             dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(
@@ -198,7 +202,14 @@ for ii in range(args.itr):
                         outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                     else:
                         outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        # ****
+                        # if we want to map to only target output, insert the new model/layer here
+                        # ****
 
+                    # forecasting task, options:[M, S, MS]; M:multivariate predict multivariate,
+                    # S:univariate predict univariate, MS:multivariate predict univariate'
+                    # if multivariate predict univariate',then output should be the last column of the decoder
+                    # output, so f_dim = -1 to only contain the last column, else is all columns
                     f_dim = -1 if args.features == 'MS' else 0
                     outputs = outputs[:, -args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
@@ -216,6 +227,7 @@ for ii in range(args.itr):
                 loss = criterion(outputs, batch_y)
                 train_loss.append(loss.item())
 
+            # When train iters. reach a multiple of 100, print the speed, left time, loss. etc
             if (i + 1) % 100 == 0:
                 accelerator.print(
                     "\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -225,6 +237,7 @@ for ii in range(args.itr):
                 iter_count = 0
                 time_now = time.time()
 
+            # backprop
             if args.use_amp:
                 scaler.scale(loss).backward()
                 scaler.step(model_optim)
@@ -237,6 +250,7 @@ for ii in range(args.itr):
                 adjust_learning_rate(accelerator, model_optim, scheduler, epoch + 1, args, printout=False)
                 scheduler.step()
 
+        # validation and testing
         accelerator.print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
         train_loss = np.average(train_loss)
         vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
@@ -244,12 +258,17 @@ for ii in range(args.itr):
         accelerator.print(
             "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
                 epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
+        # with open('output.txt', 'a') as f:
+        #     f.write("Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}\n".format(
+        #         epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
 
+        # early stopping?
         early_stopping(vali_loss, model, path)
         if early_stopping.early_stop:
             accelerator.print("Early stopping")
             break
 
+        # adjust learning rate
         if args.lradj != 'TST':
             if args.lradj == 'COS':
                 scheduler.step()
@@ -264,7 +283,7 @@ for ii in range(args.itr):
             accelerator.print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
 accelerator.wait_for_everyone()
-if accelerator.is_local_main_process:
-    path = './checkpoints'  # unique checkpoint saving path
-    del_files(path)  # delete checkpoint files
-    accelerator.print('success delete checkpoints')
+# if accelerator.is_local_main_process:
+    # path = './checkpoints'  # unique checkpoint saving path
+    # del_files(path)  # delete checkpoint files
+    # accelerator.print('success delete checkpoints')

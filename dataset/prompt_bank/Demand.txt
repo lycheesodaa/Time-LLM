@@ -1,0 +1,1 @@
+This dataset consists of historical hourly electricity demand in Singapore from 2016 to 2023. Alongside the actual demand are the met and forecasted demand by NEMS, the prevailing electricity price, the individual time components, several local weather-related indicators and PSI information of different parts of the island.
