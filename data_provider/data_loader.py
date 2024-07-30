@@ -495,9 +495,9 @@ class Dataset_Stocks(Dataset):
 
 class Dataset_Demand(Dataset):
     def __init__(self, root_path, flag='train', size=None,
-                 features='S',  data_path='demand_data_all_cleaned.csv',
-                 target='price', scale=True, timeenc=0, freq='h', percent=100,
-                 seasonal_patterns=None):
+                 features='MS',  data_path='demand_data_all_cleaned.csv',
+                 target='actual', scale=True, timeenc=0, freq='h', percent=100,
+                 seasonal_patterns=None, is_channel_independent=True):
         if size is None:
             raise Exception('Please specify the seq_len, label_len or pred_len variables.')
         else:
@@ -515,6 +515,7 @@ class Dataset_Demand(Dataset):
         self.scale = scale
         self.timeenc = timeenc
         self.freq = freq
+        self.is_channel_independent = is_channel_independent
 
         self.root_path = root_path
         self.data_path = data_path
@@ -532,6 +533,19 @@ class Dataset_Demand(Dataset):
         df_raw['period'] = pd.Categorical(df_raw['period']).codes
         df_raw['day_of_week'] = pd.Categorical(df_raw['day_of_week']).codes
         df_raw['is_weekend'] = pd.Categorical(df_raw['is_weekend']).codes
+        df_raw['weatherDesc'] = pd.Categorical(df_raw['weatherDesc']).codes
+
+        # only elroy's features
+        # df_raw.drop(columns=['winddirDegree', 'windGustKmph', 'weatherDesc', 'visibility',
+        #                      'pressure', 'cloudcover', 'dewPointC', 'uvIndex','feelsLikeC'], inplace=True)
+
+        # shift target column to the end ('MS' should be passed in here)
+        reordered = [col for col in df_raw.columns if col != str(self.target)]
+        reordered.append(str(self.target))
+        df_raw = df_raw[reordered]
+
+        # extract the forecast data; the loss calculation for this is done alongside the MOMENT model
+        df_raw.drop(columns=['forecast'], inplace=True)
 
         train_ratio = 0.6
         val_ratio = 0.2
@@ -540,19 +554,16 @@ class Dataset_Demand(Dataset):
         total_len = len(df_raw)
         train_len = int(train_ratio * total_len)
         val_len = int(val_ratio * total_len)
+        test_len = int(test_ratio * total_len)
 
         border1s = [0, train_len - self.seq_len, train_len + val_len - self.seq_len]
-        border2s = [train_len, train_len + val_len, total_len]
+        border2s = [train_len, train_len + val_len, train_len + val_len + test_len]
 
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
 
         if self.set_type == 0:
             border2 = (border2 - self.seq_len) * self.percent // 100 + self.seq_len
-
-        # extract the forecast data
-        self.nem_forecast = df_raw['forecast'].values
-        df_raw.drop(columns=['forecast'], inplace=True)
 
         if self.features == 'M' or self.features == 'MS':
             cols_data = df_raw.columns[1:]
@@ -567,8 +578,8 @@ class Dataset_Demand(Dataset):
         else:
             data = df_data.values
 
-        df_stamp = df_raw[['date']][border1:border2]
-        df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        df_stamp = df_raw[['datetime']][border1:border2]
+        df_stamp['datetime'] = pd.to_datetime(df_stamp['datetime'])
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
@@ -576,9 +587,9 @@ class Dataset_Demand(Dataset):
             df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
             df_stamp['minute'] = df_stamp.date.apply(lambda row: row.minute, 1)
             df_stamp['minute'] = df_stamp.minute.map(lambda x: x // 15)
-            data_stamp = df_stamp.drop(['date'], 1).values
+            data_stamp = df_stamp.drop(['datetime'], 1).values
         elif self.timeenc == 1:
-            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = time_features(pd.to_datetime(df_stamp['datetime'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
 
         self.data_x = data[border1:border2]
@@ -592,15 +603,25 @@ class Dataset_Demand(Dataset):
         s_end = s_begin + self.seq_len
         r_begin = s_end - self.label_len
         r_end = r_begin + self.label_len + self.pred_len
-        seq_x = self.data_x[s_begin:s_end, feat_id:feat_id + 1]
-        seq_y = self.data_y[r_begin:r_end, feat_id:feat_id + 1]
+
+        if self.is_channel_independent:
+            seq_x = self.data_x[s_begin:s_end, feat_id:feat_id + 1]
+            seq_y = self.data_y[r_begin:r_end, feat_id:feat_id + 1]
+        else:
+            seq_x = self.data_x[s_begin:s_end]
+            seq_y = self.data_y[r_begin:r_end]
+
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
 
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
+    # LSTM does not need channel independence
     def __len__(self):
-        return (len(self.data_x) - self.seq_len - self.pred_len + 1) * self.enc_in
+        if self.is_channel_independent:
+            return (len(self.data_x) - self.seq_len - self.pred_len + 1) * self.enc_in
+        else:
+            return len(self.data_x) - self.seq_len - self.pred_len + 1
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)

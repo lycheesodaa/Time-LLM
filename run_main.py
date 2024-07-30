@@ -14,6 +14,8 @@ import random
 import numpy as np
 import os
 
+from models.LSTMModel import LSTMModel
+
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
@@ -33,7 +35,7 @@ parser.add_argument('--is_training', type=int, required=True, default=1, help='s
 parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
 parser.add_argument('--model_comment', type=str, required=True, default='none', help='prefix when saving test results')
 parser.add_argument('--model', type=str, required=True, default='Autoformer',
-                    help='model name, options: [Autoformer, DLinear]')
+                    help='model name, options: [Autoformer, DLinear, TimeLLM, LSTM]')
 parser.add_argument('--seed', type=int, default=2021, help='random seed')
 
 # data loader
@@ -44,7 +46,7 @@ parser.add_argument('--features', type=str, default='M',
                     help='forecasting task, options:[M, S, MS]; '
                          'M:multivariate predict multivariate, S: univariate predict univariate, '
                          'MS:multivariate predict univariate')
-parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
+parser.add_argument('--target', type=str, default=None, help='target feature in S or MS task')
 parser.add_argument('--loader', type=str, default='modal', help='dataset type')
 parser.add_argument('--freq', type=str, default='h',
                     help='freq for time features encoding, '
@@ -131,6 +133,8 @@ for ii in range(args.itr):
         model = Autoformer.Model(args).float()
     elif args.model == 'DLinear':
         model = DLinear.Model(args).float()
+    elif args.model == 'LSTM':
+        model = LSTMModel(args.enc_in, args.d_model, 2, args.pred_len).float()
     else:
         model = TimeLLM.Model(args).float()
 
@@ -143,7 +147,7 @@ for ii in range(args.itr):
     time_now = time.time()
 
     train_steps = len(train_loader)
-    early_stopping = EarlyStopping(accelerator=accelerator, patience=args.patience)
+    early_stopping = EarlyStopping(accelerator=accelerator, patience=args.patience, verbose=True)
 
     trained_parameters = []
     for p in model.parameters():
@@ -182,10 +186,12 @@ for ii in range(args.itr):
 
             batch_x = batch_x.float().to(accelerator.device) # input time horizon
             batch_y = batch_y.float().to(accelerator.device) # target horizon
+            if args.model == 'LSTM':
+                batch_y = batch_y.to(torch.bfloat16)
 
             # _mark holds information about time-related features. Specifically, it is a
             # tensor that encodes temporal information and is associated with the
-            # input data batch_x/batch_y. Not in use
+            # input data batch_x/batch_y. (not used)
             batch_x_mark = batch_x_mark.float().to(accelerator.device)
             batch_y_mark = batch_y_mark.float().to(accelerator.device)
 
@@ -258,14 +264,15 @@ for ii in range(args.itr):
         accelerator.print(
             "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
                 epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
-        # with open('output.txt', 'a') as f:
-        #     f.write("Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}\n".format(
-        #         epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
 
         # early stopping?
-        early_stopping(vali_loss, model, path)
+        early_stopping(vali_loss, model, path, (vali_loss, vali_mae_loss, test_loss, test_mae_loss))
         if early_stopping.early_stop:
             accelerator.print("Early stopping")
+            best_scores = early_stopping.all_scores
+            accelerator.print(
+                "Best scores | Vali Loss: {0:.7f} Test Loss: {1:.7f} MAE Loss: {2:.7f} Test MAE Loss: {3:.7f}".format(
+                    *best_scores))
             break
 
         # adjust learning rate

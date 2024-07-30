@@ -42,12 +42,13 @@ class EarlyStopping:
         self.verbose = verbose
         self.counter = 0
         self.best_score = None
+        self.all_scores = None
         self.early_stop = False
         self.val_loss_min = np.Inf
         self.delta = delta
         self.save_mode = save_mode
 
-    def __call__(self, val_loss, model, path):
+    def __call__(self, val_loss, model, path, all_scores=None):
         score = -val_loss
         if self.best_score is None:
             self.best_score = score
@@ -63,6 +64,7 @@ class EarlyStopping:
                 self.early_stop = True
         else:
             self.best_score = score
+            self.all_scores = all_scores
             if self.save_mode:
                 self.save_checkpoint(val_loss, model, path)
             self.counter = 0

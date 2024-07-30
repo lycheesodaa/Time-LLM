@@ -225,9 +225,14 @@ for ii in range(args.itr):
         accelerator.print(
             "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
-        early_stopping(vali_loss, model, path)  # model saving
+
+        early_stopping(vali_loss, model, path, (vali_loss, test_loss))
         if early_stopping.early_stop:
             accelerator.print("Early stopping")
+            best_scores = early_stopping.all_scores
+            accelerator.print(
+                "Best scores | Vali Loss: {1:.7f} Test Loss: {2:.7f}".format(
+                    *best_scores))
             break
 
         if args.lradj != 'TST':
