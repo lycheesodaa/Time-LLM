@@ -1,6 +1,6 @@
 import argparse
 import torch
-from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate import Accelerator, DeepSpeedPlugin, load_checkpoint_in_model, load_checkpoint_and_dispatch
 from accelerate import DistributedDataParallelKwargs
 from torch import nn, optim
 from torch.optim import lr_scheduler
@@ -19,7 +19,7 @@ from models.LSTMModel import LSTMModel
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
-from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content
+from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content, MAPELoss
 
 parser = argparse.ArgumentParser(description='Time-LLM')
 
@@ -164,9 +164,11 @@ for ii in range(args.itr):
                                             pct_start=args.pct_start,
                                             epochs=args.train_epochs,
                                             max_lr=args.learning_rate)
+    max_norm = 5.0
 
     criterion = nn.MSELoss()
     mae_metric = nn.L1Loss()
+    # mape_metric = MAPELoss
 
     train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
         train_loader, vali_loader, test_loader, model, model_optim, scheduler)
@@ -174,6 +176,7 @@ for ii in range(args.itr):
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
 
+    start = time.time()
     for epoch in range(args.train_epochs):
         iter_count = 0
         train_loss = []
@@ -182,12 +185,10 @@ for ii in range(args.itr):
         epoch_time = time.time()
         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(train_loader), total=len(train_loader)):
             iter_count += 1
-            model_optim.zero_grad()
+            model_optim.zero_grad(set_to_none=True)
 
             batch_x = batch_x.float().to(accelerator.device) # input time horizon
             batch_y = batch_y.float().to(accelerator.device) # target horizon
-            if args.model == 'LSTM':
-                batch_y = batch_y.to(torch.bfloat16)
 
             # _mark holds information about time-related features. Specifically, it is a
             # tensor that encodes temporal information and is associated with the
@@ -246,10 +247,13 @@ for ii in range(args.itr):
             # backprop
             if args.use_amp:
                 scaler.scale(loss).backward()
+                scaler.unscale_(model_optim)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
                 scaler.step(model_optim)
                 scaler.update()
             else:
                 accelerator.backward(loss)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
                 model_optim.step()
 
             if args.lradj == 'TST':
@@ -268,11 +272,18 @@ for ii in range(args.itr):
         # early stopping?
         early_stopping(vali_loss, model, path, (vali_loss, vali_mae_loss, test_loss, test_mae_loss))
         if early_stopping.early_stop:
+            elapsed = time.time() - start
+            print(f'Time elapsed: {elapsed}')
+
             accelerator.print("Early stopping")
             best_scores = early_stopping.all_scores
             accelerator.print(
                 "Best scores | Vali Loss: {0:.7f} Test Loss: {1:.7f} MAE Loss: {2:.7f} Test MAE Loss: {3:.7f}".format(
                     *best_scores))
+
+            accelerator.print("Exporting model predictions to CSV...")
+            accelerator.load_state(str(path) + '/checkpoint')
+            vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric, best=True)
             break
 
         # adjust learning rate

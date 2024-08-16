@@ -1,4 +1,7 @@
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 import shutil
@@ -79,8 +82,8 @@ class EarlyStopping:
                     f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
 
         if self.accelerator is not None:
-            model = self.accelerator.unwrap_model(model)
-            torch.save(model.state_dict(), path + '/' + 'checkpoint')
+            self.accelerator.save_state(path + '/checkpoint')
+            # torch.save(model.state_dict(), path + '/' + 'checkpoint')
         else:
             torch.save(model.state_dict(), path + '/' + 'checkpoint')
         self.val_loss_min = val_loss
@@ -136,9 +139,13 @@ def del_files(dir_path):
     shutil.rmtree(dir_path)
 
 
-def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric):
+def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric, best=False):
     total_loss = []
     total_mae_loss = []
+    all_preds = []
+    all_true = []
+    dates = []
+
     model.eval()
     with torch.no_grad():
         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(vali_loader), total=len(vali_loader)):
@@ -165,7 +172,7 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
                 else:
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-            outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
+            outputs, batch_y, batch_y_mark = accelerator.gather_for_metrics((outputs, batch_y, batch_y_mark))
 
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
@@ -175,17 +182,57 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
             true = batch_y.detach()
 
             loss = criterion(pred, true)
-
             mae_loss = mae_metric(pred, true)
+
+            if best:
+                all_preds.append(pred.view(-1, 1))
+                all_true.append(true.view(-1, 1))
+                dates.append(batch_y_mark.detach()[:, -args.pred_len:, :].view(-1, 6))
 
             total_loss.append(loss.item())
             total_mae_loss.append(mae_loss.item())
+
+    if best:
+        # Concatenate all predictions and indices
+        all_preds = accelerator.gather(torch.cat(all_preds))
+        all_true = accelerator.gather(torch.cat(all_true))
+        dates = accelerator.gather(torch.cat(dates))
+
+        if accelerator.is_main_process:
+            all_preds = all_preds.cpu().float().numpy()
+            all_true = all_true.cpu().float().numpy()
+            dates = dates.cpu().float().numpy()
+
+            # inverse the scaling
+            all_preds = vali_data.target_inverse_transform(all_preds.reshape(-1, 1)).reshape(-1)
+            all_true = vali_data.target_inverse_transform(all_true.reshape(-1, 1)).reshape(-1)
+
+            dates = pd.DataFrame(dates, columns=['year', 'month', 'day', 'weekday', 'hour', 'minute'])
+            df = pd.DataFrame({
+                'pred': all_preds,
+                'true': all_true
+            })
+            df = pd.concat([dates, df], axis=1)
+            df['date'] = df.apply(create_datetime, axis=1)
+            df.drop(columns=['year', 'month', 'day', 'weekday', 'hour', 'minute'], inplace=True)
+            df.to_csv(f'results/data/LSTM_Demand_pl{args.pred_len}_dm{args.d_model}_predictions.csv')
+
+            # loss calculation is not as accurate here, calculate from raw data alone
+            data = pd.DataFrame({
+                'mse_loss_scaled': total_loss,
+                'mae_loss': total_mae_loss
+            })
+            data.to_csv(f'results/data/LSTM_Demand_pl{args.pred_len}_dm{args.d_model}_losses.csv')
 
     total_loss = np.average(total_loss)
     total_mae_loss = np.average(total_mae_loss)
 
     model.train()
     return total_loss, total_mae_loss
+
+
+def create_datetime(row):
+    return datetime(row['year'], row['month'], row['day'], row['hour'], row['minute'])
 
 
 def test(args, accelerator, model, train_loader, vali_loader, criterion):
@@ -233,3 +280,18 @@ def load_content(args):
     with open('./dataset/prompt_bank/{0}.txt'.format(file), 'r') as f:
         content = f.read()
     return content
+
+
+def MAPELoss(pred, true):
+    """
+    Calculate Mean Absolute Percentage Error (MAPE)
+
+    Args:
+    pred (torch.Tensor): Predicted values
+    true (torch.Tensor): True values
+
+    Returns:
+    torch.Tensor: MAPE value
+    """
+    epsilon = 1e-8  # Small constant to avoid division by zero
+    return torch.mean(torch.abs((true - pred) / (true + epsilon))) * 100
