@@ -6,7 +6,7 @@ from torch import nn, optim
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 
-from models import Autoformer, DLinear, TimeLLM
+from models import Autoformer, DLinear, TimeLLM, Informer
 
 from data_provider.data_factory import data_provider
 import time
@@ -14,7 +14,8 @@ import random
 import numpy as np
 import os
 
-from models.LSTMModel import LSTMModel
+from models.LSTMModel import LSTMModel, ConvLSTMModel, LSTMGRUModel, GRUAttentionModel, Decomp_LSTM
+from models.NeuralNetwork import BPNN, CNN
 
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
@@ -35,7 +36,7 @@ parser.add_argument('--is_training', type=int, required=True, default=1, help='s
 parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
 parser.add_argument('--model_comment', type=str, required=True, default='none', help='prefix when saving test results')
 parser.add_argument('--model', type=str, required=True, default='Autoformer',
-                    help='model name, options: [Autoformer, DLinear, TimeLLM, LSTM]')
+                    help='model name, options: [Autoformer, Informer, DLinear, TimeLLM, LSTM]')
 parser.add_argument('--seed', type=int, default=2021, help='random seed')
 
 # data loader
@@ -53,6 +54,7 @@ parser.add_argument('--freq', type=str, default='h',
                          'options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], '
                          'you can also use more detailed freq like 15min or 3h')
 parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
+parser.add_argument('--scale', type=bool, default=True, action=argparse.BooleanOptionalAction, help='whether to scale with the data loader')
 
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
@@ -61,9 +63,9 @@ parser.add_argument('--pred_len', type=int, default=96, help='prediction sequenc
 parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 
 # model define
-parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
-parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
-parser.add_argument('--c_out', type=int, default=7, help='output size')
+parser.add_argument('--enc_in', type=int, default=None, help='encoder input size')
+parser.add_argument('--dec_in', type=int, default=None, help='decoder input size')
+parser.add_argument('--c_out', type=int, default=None, help='output size')
 parser.add_argument('--d_model', type=int, default=16, help='dimension of model')
 parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
 parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
@@ -81,6 +83,7 @@ parser.add_argument('--stride', type=int, default=8, help='stride')
 parser.add_argument('--prompt_domain', type=int, default=0, help='')
 parser.add_argument('--llm_model', type=str, default='LLAMA', help='LLM model') # LLAMA, GPT2, BERT
 parser.add_argument('--llm_dim', type=int, default='4096', help='LLM model dimension')# LLama7b:4096; GPT2-small:768; BERT-base:768
+parser.add_argument('--distil', type=bool, default=True)
 
 
 # optimization
@@ -99,6 +102,11 @@ parser.add_argument('--pct_start', type=float, default=0.2, help='pct_start')
 parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 parser.add_argument('--llm_layers', type=int, default=6)
 parser.add_argument('--percent', type=int, default=100)
+
+parser.add_argument('--results_path', type=str, default='./results/data/')
+parser.add_argument('--eval_only', type=bool, default=False)
+parser.add_argument('--decomp_type', type=str, default=None)
+parser.add_argument('--feats_pct', type=int, default=None)
 
 args = parser.parse_args()
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -129,20 +137,47 @@ for ii in range(args.itr):
     vali_data, vali_loader = data_provider(args, 'val')
     test_data, test_loader = data_provider(args, 'test')
 
+    if args.enc_in is None:
+        args.enc_in = train_data.enc_in
+        args.dec_in = train_data.enc_in
+    else:
+        assert args.enc_in == train_data.enc_in
+
+    if args.c_out is None:
+        args.c_out = train_data.enc_in
+
     if args.model == 'Autoformer':
         model = Autoformer.Model(args).float()
+    elif args.model == 'Informer':
+        model = Informer.Model(args).float()
     elif args.model == 'DLinear':
         model = DLinear.Model(args).float()
     elif args.model == 'LSTM':
-        model = LSTMModel(args.enc_in, args.d_model, 2, args.pred_len).float()
+        # scale within the model input window if dataloader scaling is not used
+        if args.decomp_type is not None:
+            model = Decomp_LSTM(args.enc_in, args.d_model, 2, args.pred_len, args.decomp_type, window_norm=not args.scale).float()
+        else:
+            model = LSTMModel(args.enc_in, args.d_model, 2, args.pred_len, window_norm=not args.scale).float()
+    elif args.model == 'BPNN':
+        model = BPNN(args.seq_len, args.enc_in, args.pred_len)
+    elif args.model == 'CNN':
+        model = CNN(args.seq_len, args.enc_in, args.pred_len)
+    elif args.model == 'ConvLSTM':
+        model = ConvLSTMModel(args.enc_in, args.d_model, 2, args.pred_len).float()
+    elif args.model == 'GRU':
+        model = LSTMGRUModel(args.enc_in, args.d_model, 2, args.pred_len).float()
+    elif args.model == 'GRUAttention':
+        model = GRUAttentionModel(args.enc_in, args.d_model, 2, args.pred_len).float()
     else:
         model = TimeLLM.Model(args).float()
+        args.content = load_content(args)
 
     path = os.path.join(args.checkpoints,
                         setting + '-' + args.model_comment)  # unique checkpoint saving path
-    args.content = load_content(args)
     if not os.path.exists(path) and accelerator.is_local_main_process:
         os.makedirs(path)
+    if not os.path.exists(args.results_path) and accelerator.is_local_main_process:
+        os.makedirs(args.results_path)
 
     time_now = time.time()
 
@@ -176,14 +211,26 @@ for ii in range(args.itr):
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
 
+    # if os.path.exists(path + '/checkpoint'):
+    #     accelerator.load_state(str(path) + '/checkpoint')
+    #     vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric, best=True)
+    #     exit()
+
     start = time.time()
+
+    if args.eval_only:
+        accelerator.load_state(str(path) + '/checkpoint')
+        vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric, best=True)
+        exit()
+
     for epoch in range(args.train_epochs):
         iter_count = 0
         train_loss = []
 
         model.train()
         epoch_time = time.time()
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(train_loader), total=len(train_loader)):
+        for i, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+            batch_x, batch_y, batch_x_mark, batch_y_mark = batch
             iter_count += 1
             model_optim.zero_grad(set_to_none=True)
 
@@ -209,9 +256,6 @@ for ii in range(args.itr):
                         outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                     else:
                         outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        # ****
-                        # if we want to map to only target output, insert the new model/layer here
-                        # ****
 
                     # forecasting task, options:[M, S, MS]; M:multivariate predict multivariate,
                     # S:univariate predict univariate, MS:multivariate predict univariate'
@@ -264,7 +308,8 @@ for ii in range(args.itr):
         accelerator.print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
         train_loss = np.average(train_loss)
         vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
-        test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
+        # test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
+        test_loss, test_mae_loss = 0, 0
         accelerator.print(
             "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
                 epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))

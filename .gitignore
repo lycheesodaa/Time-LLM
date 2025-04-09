@@ -1,0 +1,14 @@
+# folders
+checkpoints
+.idea
+results
+*/__pycache__
+test
+.vscode
+dataset
+figures
+m4_results
+
+# environment files
+venv
+.env

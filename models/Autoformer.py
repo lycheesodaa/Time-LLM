@@ -23,6 +23,10 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         self.output_attention = configs.output_attention
 
+        # intra-window normalization configs
+        self.window_norm = not configs.scale
+        self.eps = 1e-8
+
         # Decomp
         kernel_size = configs.moving_avg
         self.decomp = series_decomp(kernel_size)
@@ -86,7 +90,24 @@ class Model(nn.Module):
             self.projection = nn.Linear(
                 configs.d_model * configs.seq_len, configs.num_class)
 
+    def normalize_sequence(self, x_enc, x_dec):
+        # Compute mean and std along the time dimension (dim=1)
+        # Keep dims=True to maintain broadcasting dimensions
+        # Use only the encoder sequence statistics (x_dec is a subset of x_enc)
+        mean = x_enc.mean(dim=1, keepdim=True)
+        std = x_enc.std(dim=1, keepdim=True) + self.eps
+
+        # Store statistics for denormalization
+        self.last_mean = mean
+        self.last_std = std
+
+        return (x_enc - mean) / std, (x_dec - mean) / std
+
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        if self.window_norm:
+            # normalizse both enc and dec sequence
+            x_enc, x_dec = self.normalize_sequence(x_enc, x_dec)
+
         # decomp init
         mean = torch.mean(x_enc, dim=1).unsqueeze(
             1).repeat(1, self.pred_len, 1)
@@ -107,6 +128,11 @@ class Model(nn.Module):
                                                  trend=trend_init)
         # final
         dec_out = trend_part + seasonal_part
+
+        if self.window_norm:
+            # inverse normalization
+            dec_out = dec_out * self.last_std + self.last_mean
+
         return dec_out
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):

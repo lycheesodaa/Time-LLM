@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 
 import numpy as np
@@ -55,6 +56,7 @@ class EarlyStopping:
         score = -val_loss
         if self.best_score is None:
             self.best_score = score
+            self.all_scores = all_scores
             if self.save_mode:
                 self.save_checkpoint(val_loss, model, path)
         elif score < self.best_score + self.delta:
@@ -82,7 +84,7 @@ class EarlyStopping:
                     f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
 
         if self.accelerator is not None:
-            self.accelerator.save_state(path + '/checkpoint')
+            self.accelerator.save_state(path + '/checkpoint', safe_serialization=False)
             # torch.save(model.state_dict(), path + '/' + 'checkpoint')
         else:
             torch.save(model.state_dict(), path + '/' + 'checkpoint')
@@ -144,13 +146,16 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
     total_mae_loss = []
     all_preds = []
     all_true = []
-    dates = []
+    # dates = []
 
     model.eval()
     with torch.no_grad():
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(vali_loader), total=len(vali_loader)):
+        for i, batch in tqdm(enumerate(vali_loader), total=len(vali_loader)):
+            batch_x, batch_y, batch_x_mark, batch_y_mark = batch
             batch_x = batch_x.float().to(accelerator.device)
             batch_y = batch_y.float()
+            # print('x:', batch_x.shape)
+            # print('y', batch_y.shape)
 
             batch_x_mark = batch_x_mark.float().to(accelerator.device)
             batch_y_mark = batch_y_mark.float().to(accelerator.device)
@@ -174,6 +179,8 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
 
             outputs, batch_y, batch_y_mark = accelerator.gather_for_metrics((outputs, batch_y, batch_y_mark))
 
+            # print('outputs:', outputs.shape)
+
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
             batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
@@ -185,9 +192,9 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
             mae_loss = mae_metric(pred, true)
 
             if best:
-                all_preds.append(pred.view(-1, 1))
-                all_true.append(true.view(-1, 1))
-                dates.append(batch_y_mark.detach()[:, -args.pred_len:, :].view(-1, 6))
+                all_preds.append(pred.reshape(-1, 1))
+                all_true.append(true.reshape(-1, 1))
+                # dates.append(batch_y_mark.detach()[:, -args.pred_len:, :].view(-1, 6))
 
             total_loss.append(loss.item())
             total_mae_loss.append(mae_loss.item())
@@ -196,33 +203,43 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
         # Concatenate all predictions and indices
         all_preds = accelerator.gather(torch.cat(all_preds))
         all_true = accelerator.gather(torch.cat(all_true))
-        dates = accelerator.gather(torch.cat(dates))
+        # dates = accelerator.gather(torch.cat(dates))
 
         if accelerator.is_main_process:
             all_preds = all_preds.cpu().float().numpy()
             all_true = all_true.cpu().float().numpy()
-            dates = dates.cpu().float().numpy()
+            # dates = dates.cpu().float().numpy()
 
-            # inverse the scaling
-            all_preds = vali_data.target_inverse_transform(all_preds.reshape(-1, 1)).reshape(-1)
-            all_true = vali_data.target_inverse_transform(all_true.reshape(-1, 1)).reshape(-1)
+            if args.scale:
+                # inverse the scaling
+                all_preds = vali_data.target_inverse_transform(all_preds.reshape(-1, 1)).reshape(-1)
+                all_true = vali_data.target_inverse_transform(all_true.reshape(-1, 1)).reshape(-1)
 
-            dates = pd.DataFrame(dates, columns=['year', 'month', 'day', 'weekday', 'hour', 'minute'])
             df = pd.DataFrame({
-                'pred': all_preds,
-                'true': all_true
+                'pred': all_preds.reshape(-1),
+                'true': all_true.reshape(-1)
             })
-            df = pd.concat([dates, df], axis=1)
-            df['date'] = df.apply(create_datetime, axis=1)
-            df.drop(columns=['year', 'month', 'day', 'weekday', 'hour', 'minute'], inplace=True)
-            df.to_csv(f'results/data/LSTM_Demand_pl{args.pred_len}_dm{args.d_model}_predictions.csv')
 
-            # loss calculation is not as accurate here, calculate from raw data alone
-            data = pd.DataFrame({
-                'mse_loss_scaled': total_loss,
-                'mae_loss': total_mae_loss
-            })
-            data.to_csv(f'results/data/LSTM_Demand_pl{args.pred_len}_dm{args.d_model}_losses.csv')
+            # extra line just for decomposition LSTM models
+            model_name = args.model if args.decomp_type is None else f'{args.decomp_type}-{args.model}'
+
+            export_str = args.results_path + f'{model_name}_{args.data}_pl{args.pred_len}_dm{args.d_model}_predictions.csv'
+            df.to_csv(export_str)
+
+            log_into_csv(
+                results_df=df,
+                name=args.des,
+                stage='',
+                model=model_name,
+                seq_len=args.seq_len,
+                pred_len=args.pred_len,
+                lr=args.learning_rate,
+                bsz=args.batch_size,
+                log_file_name=f'{args.data}_{model_name}',
+                pred_col_name='pred'
+            )
+
+            print(f"Exported to {export_str}")
 
     total_loss = np.average(total_loss)
     total_mae_loss = np.average(total_mae_loss)
@@ -232,6 +249,7 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
 
 
 def create_datetime(row):
+    row = row.astype(int)
     return datetime(row['year'], row['month'], row['day'], row['hour'], row['minute'])
 
 
@@ -295,3 +313,104 @@ def MAPELoss(pred, true):
     """
     epsilon = 1e-8  # Small constant to avoid division by zero
     return torch.mean(torch.abs((true - pred) / (true + epsilon))) * 100
+
+
+def calculate_mse(y_true: list, y_pred: list) -> float:
+    """
+    Calculate the Mean Squared Error (MSE) between true and predicted values.
+
+    Args:
+    y_true: Array of true values
+    y_pred: Array of predicted values
+
+    Returns:
+    float: The calculated MSE
+
+    Raises:
+    ValueError: If the input arrays have different shapes
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    if y_true.shape != y_pred.shape:
+        raise ValueError("True and predicted arrays must have the same shape")
+
+    return np.mean((y_true - y_pred) ** 2)
+
+
+def calculate_mape(y_true: list, y_pred: list) -> float:
+    """
+    Calculate the Mean Absolute Percentage Error (MAPE) between true and predicted values.
+
+    Args:
+    y_true: Array of true values
+    y_pred: Array of predicted values
+
+    Returns:
+    float: The calculated MAPE
+
+    Raises:
+    ValueError: If the input arrays have different shapes
+    ZeroDivisionError: If any true value is zero
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    if y_true.shape != y_pred.shape:
+        raise ValueError("True and predicted arrays must have the same shape")
+
+    if np.any(y_true == 0):
+        raise ZeroDivisionError("MAPE is undefined when true values contain zeros")
+
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+
+def log_into_csv(
+    results_df: pd.DataFrame,
+    name: str,
+    stage: str,
+    model: str = 'LSTM',
+    seq_len: int = 512,
+    pred_len: int = 96,
+    lr: float = None,
+    bsz: int = 16,
+    log_file_name: str = 'demand',
+    pred_col_name: str = 'actual',
+    args: dict | None = None,
+):
+    log_file = f'results/{log_file_name}_runs.csv'
+
+    # Create sample first line in records
+    if not os.path.exists(log_file):
+        df = pd.DataFrame({
+            'timestamp': datetime.now(),
+            'name': 'sample',
+            'stage': 'finetuned',
+            'model': 'LSTM',
+            'seq_len': 512,
+            'pred_len': 96,
+            'lr': 0.01,
+            'bsz': 16,
+            'score_type': 'mape',
+            'score': 1.23,
+        }, index=[0])
+        df.to_csv(log_file)
+
+    curr_run = pd.DataFrame({
+        'timestamp': datetime.now(),
+        'name': name,
+        'stage': stage,
+        'model': model,
+        'seq_len': seq_len,
+        'pred_len': pred_len,
+        'lr': lr,
+        'bsz': bsz,
+        'score_type': 'mape',
+        'score': calculate_mape(results_df['true'], results_df[pred_col_name])
+    }, index=[0])
+
+    df = pd.read_csv(log_file, index_col=0)
+    assert len(df.columns) == len(curr_run.columns)
+
+    df = pd.concat([df, curr_run]).reset_index(drop=True)
+    df.to_csv(log_file)

@@ -1,5 +1,5 @@
 from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_M4, Dataset_Stocks, \
-    Dataset_Demand
+    Dataset_Demand, Dataset_Carbon, Dataset_Carbon_Monthly, Dataset_Carbon_Daily_Decomp
 from torch.utils.data import DataLoader
 
 data_dict = {
@@ -12,7 +12,10 @@ data_dict = {
     'Weather': Dataset_Custom,
     'm4': Dataset_M4,
     'Stocks': Dataset_Stocks,
-    'Demand': Dataset_Demand
+    'Demand': Dataset_Demand,
+    'Carbon': Dataset_Carbon,
+    'Carbon_Monthly': Dataset_Carbon_Monthly,
+    'Carbon_Daily_Decomp': Dataset_Carbon_Daily_Decomp,
 }
 
 
@@ -23,12 +26,12 @@ def data_provider(args, flag):
 
     if flag == 'test':
         shuffle_flag = False
-        drop_last = True
+        drop_last = False
         batch_size = args.batch_size
         freq = args.freq
     else:
         shuffle_flag = True
-        drop_last = True
+        drop_last = False
         batch_size = args.batch_size
         freq = args.freq
 
@@ -41,11 +44,12 @@ def data_provider(args, flag):
             size=[args.seq_len, args.label_len, args.pred_len],
             features=args.features,
             target=args.target,
+            scale=args.scale,
             timeenc=timeenc,
             freq=freq,
             seasonal_patterns=args.seasonal_patterns
         )
-    if args.model == 'LSTM':
+    elif 'Carbon' in args.data:
         data_set = Data(
             root_path=args.root_path,
             data_path=args.data_path,
@@ -53,11 +57,12 @@ def data_provider(args, flag):
             size=[args.seq_len, args.label_len, args.pred_len],
             features=args.features,
             target=args.target,
+            scale=args.scale,
             timeenc=timeenc,
             freq=freq,
             percent=percent,
             seasonal_patterns=args.seasonal_patterns,
-            is_channel_independent=False
+            feats_pct=args.feats_pct,
         )
     else:
         data_set = Data(
@@ -67,11 +72,14 @@ def data_provider(args, flag):
             size=[args.seq_len, args.label_len, args.pred_len],
             features=args.features,
             target=args.target,
+            scale=args.scale,
             timeenc=timeenc,
             freq=freq,
             percent=percent,
             seasonal_patterns=args.seasonal_patterns
         )
+
+    print(f'{flag} dataset length:', len(data_set))
 
     data_loader = DataLoader(
         data_set,
